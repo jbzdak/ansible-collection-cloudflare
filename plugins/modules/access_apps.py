@@ -85,6 +85,71 @@ options:
     type: str
     description:
       - URL of the application logo.
+  oauth_configuration:
+    type: dict
+    version_added: '2.2.0'
+    description:
+      - Managed OAuth settings that make Access the OAuth 2.0 authorization server for the application.
+      - Cloudflare documents that an application update overwrites the existing configuration. When the module
+        updates an application, it keeps the current Managed OAuth settings that this option does not set.
+      - Omitting this option leaves Managed OAuth unmanaged. Set O(oauth_configuration.enabled=false) to turn
+        Managed OAuth off. A self-hosted application without Managed OAuth settings matches
+        O(oauth_configuration.enabled=false), whatever other suboptions are set.
+      - When the current application returns Managed OAuth settings without C(enabled), the module fails
+        instead of updating the application unless this option is set, because Cloudflare treats an omitted
+        C(enabled) as V(true).
+      - The module neither compares nor changes a suboption that is unset. Removing a value from the play keeps
+        the current value; the module cannot restore the Cloudflare default.
+    suboptions:
+      enabled:
+        type: bool
+        required: true
+        description:
+          - Whether Access handles OAuth for the application.
+          - A current application that does not return this value is reported as changed.
+      dynamic_client_registration:
+        type: dict
+        description:
+          - Settings for OAuth dynamic client registration.
+          - Cloudflare does not document defaults for unset Boolean suboptions, and its Terraform provider treats
+            unset and V(true) as equal. Set O(oauth_configuration.dynamic_client_registration.enabled),
+            O(oauth_configuration.dynamic_client_registration.allow_any_on_localhost), and
+            O(oauth_configuration.dynamic_client_registration.allow_any_on_loopback) explicitly to pin them.
+        suboptions:
+          enabled:
+            type: bool
+            description:
+              - Whether dynamic client registration is enabled.
+          allow_any_on_localhost:
+            type: bool
+            description:
+              - Whether to allow any client with redirect URIs on C(localhost).
+          allow_any_on_loopback:
+            type: bool
+            description:
+              - Whether to allow any client with redirect URIs on C(127.0.0.1).
+          allowed_uris:
+            type: list
+            elements: str
+            description:
+              - Redirect URIs allowed for dynamically registered clients.
+              - HTTP and HTTPS paths may end in C(/*) to match all sub-paths.
+              - Custom-scheme URIs must match exactly.
+              - An empty list clears the allowed URIs and matches an application that returns none.
+      grant:
+        type: dict
+        description:
+          - Settings for OAuth grant behavior.
+        suboptions:
+          access_token_lifetime:
+            type: str
+            description:
+              - Lifetime of an OAuth access token, such as C(15m) or C(2h45m).
+              - Cloudflare documents a default of 15 minutes.
+          session_duration:
+            type: str
+            description:
+              - Lifetime of the OAuth grant session and its refresh token, such as C(336h).
   policies:
     type: list
     elements: dict
@@ -136,6 +201,25 @@ EXAMPLES = r"""
     name: app
     domain: app.example.com
     type: self_hosted
+
+- name: Ensure Access application uses Managed OAuth
+  linuxhq.cloudflare.access_apps:
+    account_id: "{{ account_id }}"
+    api_token: "{{ cloudflare_api_token }}"
+    name: mcp
+    domain: mcp.example.com
+    type: self_hosted
+    oauth_configuration:
+      enabled: true
+      dynamic_client_registration:
+        enabled: true
+        allow_any_on_localhost: false
+        allow_any_on_loopback: false
+        allowed_uris:
+          - https://client.example.com/oauth/callback
+      grant:
+        access_token_lifetime: 15m
+        session_duration: 336h
 """
 
 RETURN = r"""
@@ -161,6 +245,7 @@ message:
 """
 
 from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.common.dict_transformations import dict_merge
 
 from ansible_collections.linuxhq.cloudflare.plugins.module_utils.cloudflare_utils import (
     cloudflare_client,
@@ -175,8 +260,7 @@ from ansible_collections.linuxhq.cloudflare.plugins.module_utils.cloudflare_util
     resource_field,
     resource_id,
     select_fields,
-    validate_requested_values,
-    values_differ,
+    serialize_resource,
 )
 
 FIELDS = (
@@ -192,6 +276,7 @@ FIELDS = (
     "http_only_cookie_attribute",
     "logo_url",
     "name",
+    "oauth_configuration",
     "policies",
     "same_site_cookie_attribute",
     "service_auth_401_redirect",
@@ -207,6 +292,98 @@ DEFAULT_FIELDS = {
     "http_only_cookie_attribute": True,
     "session_duration": "24h",
 }
+
+
+def without_unset_values(value):
+    if not isinstance(value, dict):
+        return value
+
+    values = {key: without_unset_values(item) for key, item in value.items()}
+
+    return {key: item for key, item in values.items() if item is not None and item != {}}
+
+
+def comparable_access_app(access_app, desired):
+    comparable = {**DEFAULT_FIELDS, **access_app}
+    requested = desired.get("oauth_configuration")
+    if not isinstance(requested, dict):
+        return comparable
+
+    current = comparable.get("oauth_configuration")
+    if current is None and requested.get("enabled") is False and comparable.get("type") == "self_hosted":
+        current = requested
+
+    requested_registration = requested.get("dynamic_client_registration", {})
+    if (
+        isinstance(current, dict)
+        and isinstance(requested_registration, dict)
+        and requested_registration.get("allowed_uris") == []
+    ):
+        registration = current.get("dynamic_client_registration") or {}
+        if isinstance(registration, dict) and registration.get("allowed_uris") is None:
+            current = {**current, "dynamic_client_registration": {**registration, "allowed_uris": []}}
+
+    comparable["oauth_configuration"] = current
+
+    return comparable
+
+
+def differing_paths(current, desired, prefix=""):
+    if isinstance(current, dict) and isinstance(desired, dict):
+        return [
+            path
+            for key in sorted(set(current) | set(desired))
+            for path in differing_paths(current.get(key), desired.get(key), f"{prefix}{key}.")
+        ]
+
+    return [] if current == desired else [prefix[:-1]]
+
+
+def differing_fields(access_app, desired):
+    current = normalize_current_by_desired_fields(
+        select_fields(comparable_access_app(access_app, desired), desired.keys()),
+        desired,
+    )
+
+    return differing_paths(serialize_resource(current), serialize_resource(desired))
+
+
+def validate_applied(module, access_app, desired, app_id):
+    fields = differing_fields(access_app, desired)
+    if fields:
+        module.fail_json(
+            msg=(
+                f"Cloudflare did not apply the requested Access application {app_id}; "
+                f"differing fields: {', '.join(fields)}"
+            ),
+        )
+
+
+def update_body(module, current, current_id, payload):
+    current_oauth_configuration = current.get("oauth_configuration")
+    if current_oauth_configuration is None:
+        return payload
+
+    if not isinstance(current_oauth_configuration, dict) or any(
+        not isinstance(current_oauth_configuration.get(field), (dict, type(None)))
+        for field in ("dynamic_client_registration", "grant")
+    ):
+        module.fail_json(msg=f"Cloudflare API returned malformed Access application {current_id} data")
+
+    if "oauth_configuration" not in payload and not isinstance(current_oauth_configuration.get("enabled"), bool):
+        module.fail_json(
+            msg=(
+                f"Access application {current_id} returned Managed OAuth settings without enabled; "
+                "set oauth_configuration to update it"
+            ),
+        )
+
+    return {
+        **payload,
+        "oauth_configuration": without_unset_values(
+            dict_merge(current_oauth_configuration, payload.get("oauth_configuration", {}))
+        ),
+    }
 
 
 def endpoint(account_id):
@@ -231,20 +408,17 @@ def ensure_present(module, client):
     )
 
     payload = payload_from_params(params, FIELDS)
+    if "oauth_configuration" in payload:
+        payload["oauth_configuration"] = without_unset_values(payload["oauth_configuration"])
 
     if current is None:
         if module.check_mode:
             module.exit_json(changed=True, message="Access application would be created")
 
         access_app = post_result(client, endpoint(params["account_id"]), payload)
-        resource_id(module, access_app, "Access application")
+        app_id = resource_id(module, access_app, "Access application")
         resource_field(module, access_app, "name", "Access application", expected=params["name"])
-        validate_requested_values(
-            module,
-            {**DEFAULT_FIELDS, **access_app},
-            payload,
-            "Access application",
-        )
+        validate_applied(module, access_app, payload, app_id)
         module.exit_json(
             changed=True,
             message="Access application created",
@@ -252,20 +426,15 @@ def ensure_present(module, client):
         )
 
     current_id = resource_id(module, current, "Access application")
-    comparable_current = {**DEFAULT_FIELDS, **current}
 
-    if not values_differ(
-        normalize_current_by_desired_fields(
-            select_fields(comparable_current, payload.keys()),
-            payload,
-        ),
-        payload,
-    ):
+    if not differing_fields(current, payload):
         module.exit_json(
             changed=False,
             message="Access application already present",
             access_app=current,
         )
+
+    body = update_body(module, current, current_id, payload)
 
     if module.check_mode:
         module.exit_json(
@@ -274,19 +443,10 @@ def ensure_present(module, client):
             access_app=current,
         )
 
-    access_app = put_result(
-        client,
-        item_endpoint(params["account_id"], current_id),
-        payload,
-    )
+    access_app = put_result(client, item_endpoint(params["account_id"], current_id), body)
     resource_id(module, access_app, "Access application", expected=current_id)
     resource_field(module, access_app, "name", "Access application", expected=params["name"])
-    validate_requested_values(
-        module,
-        {**DEFAULT_FIELDS, **access_app},
-        payload,
-        "Access application",
-    )
+    validate_applied(module, access_app, body, current_id)
     module.exit_json(
         changed=True,
         message="Access application updated",
@@ -345,6 +505,28 @@ def main():
             "enable_binding_cookie": {"type": "bool", "default": False},
             "http_only_cookie_attribute": {"type": "bool", "default": True},
             "logo_url": {"type": "str"},
+            "oauth_configuration": {
+                "type": "dict",
+                "options": {
+                    "enabled": {"type": "bool", "required": True},
+                    "dynamic_client_registration": {
+                        "type": "dict",
+                        "options": {
+                            "enabled": {"type": "bool"},
+                            "allow_any_on_localhost": {"type": "bool"},
+                            "allow_any_on_loopback": {"type": "bool"},
+                            "allowed_uris": {"type": "list", "elements": "str"},
+                        },
+                    },
+                    "grant": {
+                        "type": "dict",
+                        "options": {
+                            "access_token_lifetime": {"type": "str", "no_log": False},
+                            "session_duration": {"type": "str"},
+                        },
+                    },
+                },
+            },
             "policies": {"type": "list", "elements": "dict"},
             "same_site_cookie_attribute": {"type": "str"},
             "service_auth_401_redirect": {"type": "bool"},
