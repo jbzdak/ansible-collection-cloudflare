@@ -1,0 +1,8 @@
+---
+minor_changes:
+  - access_apps - add the ``oauth_configuration`` option to the module and role to
+    manage Cloudflare Access Managed OAuth, including dynamic client registration
+    and grant lifetimes. Updates keep the current Managed OAuth settings that the
+    option does not set, and fail before updating when the play does not set
+    ``oauth_configuration`` and the current settings do not say whether Managed
+    OAuth is enabled.

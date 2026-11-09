@@ -17,6 +17,7 @@
     http_only_cookie_attribute: "{{ _access_app.http_only_cookie_attribute | d(true) }}"
     logo_url: "{{ _access_app.logo_url | d(omit) }}"
     name: "{{ _access_app.name }}"
+    oauth_configuration: "{{ _access_app.oauth_configuration | d(omit) }}"
     policies: "{{ _access_app.policies | d(omit) }}"
     same_site_cookie_attribute: "{{ _access_app.same_site_cookie_attribute | d(omit) }}"
     service_auth_401_redirect: "{{ _access_app.service_auth_401_redirect | d(omit) }}"

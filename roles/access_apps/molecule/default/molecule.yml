@@ -56,6 +56,17 @@ provisioner:
                 uri: molecule-00.linuxhq.dev
               - type: public
                 uri: molecule-01.linuxhq.dev
+            oauth_configuration:
+              enabled: true
+              dynamic_client_registration:
+                enabled: true
+                allow_any_on_localhost: true
+                allow_any_on_loopback: false
+                allowed_uris:
+                  - https://molecule-00.linuxhq.dev/oauth/callback
+              grant:
+                access_token_lifetime: 15m
+                session_duration: 336h
             policies:
               - id: "{{ _access_policies_info_dict['molecule-00-email'].id }}"
             type: self_hosted
